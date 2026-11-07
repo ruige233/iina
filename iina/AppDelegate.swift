@@ -1175,6 +1175,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
   /// information..
   /// - Parameter url: The URL to evaluate.
   func noteNewRecentDocumentURL(_ url: URL) {
+    // The home window shows the recent documents as playback history, so recording must stop
+    // when the user turns "record playback history" off. Otherwise the list would keep growing
+    // invisibly and reappear in full as soon as the switch is turned back on.
+    guard Preference.bool(for: .recordPlaybackHistory) else { return }
     NSDocumentController.shared.noteNewRecentDocumentURL(url)
     saveRecentDocuments()
   }

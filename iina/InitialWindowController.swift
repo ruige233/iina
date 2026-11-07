@@ -28,7 +28,7 @@ fileprivate class GrayHighlightRowView: NSTableRowView {
   }
 }
 
-class InitialWindowController: NSWindowController {
+class InitialWindowController: NSWindowController, NSMenuDelegate {
   weak var player: PlayerCore!
 
   var loaded = false
@@ -41,8 +41,11 @@ class InitialWindowController: NSWindowController {
   var lastPositionLabel: NSTextField!
   var recentFilesTableTopConstraint: NSLayoutConstraint!
 
-  private let observedPrefKeys: [Preference.Key] = [.themeMaterial]
+  private let observedPrefKeys: [Preference.Key] = [.themeMaterial, .recordPlaybackHistory]
   private var currentlyHoveredRow: GrayHighlightRowView?
+
+  private var historyToggle: NSSwitch!
+  private var emptyLabel: NSTextField!
 
   override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
     guard let keyPath, let change else { return }
@@ -53,6 +56,11 @@ class InitialWindowController: NSWindowController {
       if let newValue = change[.newKey] as? Int {
         setMaterial(Preference.Theme(rawValue: newValue))
       }
+
+    case Preference.Key.recordPlaybackHistory.rawValue:
+      // The switch was toggled in Preferences. The toggle in this window is bound to the
+      // same preference so it updates itself; the list still needs to be refreshed.
+      reloadData()
 
     default:
       return
@@ -200,7 +208,48 @@ class InitialWindowController: NSWindowController {
     mainView.addSubview(scrollView)
     self.recentFilesTableTopConstraint = scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 24)
     recentFilesTableTopConstraint.isActive = true
-    scrollView.padding(.bottom(24), .horizontal(paddingH - 6))
+    scrollView.padding(.horizontal(paddingH - 6))
+
+    // Context menu (right click) for the recent files list.
+
+    let recentFilesMenu = NSMenu()
+    recentFilesMenu.delegate = self
+    recentFilesTableView.menu = recentFilesMenu
+
+    // Placeholder shown when there is nothing to display.
+
+    self.emptyLabel = NSTextField(labelWithString: "")
+    emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+    emptyLabel.textColor = .tertiaryLabelColor
+    emptyLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+    emptyLabel.alignment = .center
+    emptyLabel.isHidden = true
+    mainView.addSubview(emptyLabel)
+    emptyLabel.center(.x)
+    emptyLabel.topAnchor.constraint(equalTo: scrollView.topAnchor, constant: 48).isActive = true
+
+    // Footer: the "record playback history" switch and the "clear" button.
+
+    self.historyToggle = ui.toggleButton(bindTo: .recordPlaybackHistory, size: .small)
+    historyToggle.translatesAutoresizingMaskIntoConstraints = false
+
+    let historyToggleLabel = NSTextField(labelWithString: NSLocalizedString("settings.recordPlaybackHistory.label", comment: "Enable playback history"))
+    historyToggleLabel.translatesAutoresizingMaskIntoConstraints = false
+    historyToggleLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+    historyToggleLabel.textColor = .secondaryLabelColor
+    historyToggleLabel.lineBreakMode = .byTruncatingTail
+
+    let clearButton = NSButton(title: NSLocalizedString("history_window.toolbar.clear", comment: "Clear Playback History"), target: self, action: #selector(clearAllRecentDocuments(_:)))
+    clearButton.translatesAutoresizingMaskIntoConstraints = false
+    clearButton.isBordered = false
+    clearButton.controlSize = .small
+    clearButton.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+    clearButton.contentTintColor = .controlAccentColor
+
+    let footerRow = ui.hStack(spacing: 6, historyToggle, historyToggleLabel, ui.flexibleSpace(), clearButton)
+    mainView.addSubview(footerRow)
+    footerRow.padding(.bottom(16), .leading(paddingH - 6), .trailing(paddingH - 6))
+    scrollView.bottomAnchor.constraint(equalTo: footerRow.topAnchor, constant: -10).isActive = true
 
     self.window = window
     // make the content view the first responder, so key events are received by keyDown()
@@ -305,9 +354,139 @@ class InitialWindowController: NSWindowController {
     }
   }
 
+  // MARK: - Deleting playback history
+
+  /// Row captured when the context menu was built. The row must be remembered because
+  /// `clickedRow` is not guaranteed to still be valid once the menu item's action runs.
+  private var menuTargetRow = -1
+
+  private func showInFinder(_ url: URL) {
+    NSWorkspace.shared.activateFileViewerSelecting([url])
+  }
+
+  /// Removes one entry from the recent documents list shown on this window.
+  ///
+  /// AppKit has no API to remove a single recent document, so the whole list has to be
+  /// cleared and then re-populated with the entries that should be kept. `noteNewRecentDocumentURL`
+  /// inserts at the front, so the remaining URLs are added in reverse order to keep the
+  /// original ordering intact.
+  private func removeRecentDocument(at rowIndex: Int) {
+    guard let url = recentDocuments[at: rowIndex] else { return }
+
+    // Rebuild from the full list rather than from `recentDocuments`, because the latter has
+    // the "continue last playback" entry filtered out. Using it here would silently drop
+    // that entry from the system's recent list as a side effect of deleting another one.
+    let remaining = NSDocumentController.shared.recentDocumentURLs.filter {
+      $0.resolvingSymlinksInPath() != url.resolvingSymlinksInPath()
+    }
+    NSDocumentController.shared.clearRecentDocuments(self)
+    for url in remaining.reversed() {
+      NSDocumentController.shared.noteNewRecentDocumentURL(url)
+    }
+    // Persist the trimmed list. IINA keeps a copy of the recent documents in its
+    // preferences so that `restoreRecentDocuments` can repopulate the list on launch;
+    // without this the deleted entry would come back the next time IINA is started.
+    AppDelegate.shared.saveRecentDocuments()
+
+    // Also drop the playback history entry for this file, otherwise it would still show
+    // up in the Playback History window.
+    let historyEntries = HistoryController.shared.history.filter {
+      $0.url.resolvingSymlinksInPath() == url.resolvingSymlinksInPath()
+    }
+    if !historyEntries.isEmpty {
+      HistoryController.shared.remove(historyEntries)
+    }
+
+    // If the removed file is the one offered by the "continue last playback" button, that
+    // button must not point at it anymore.
+    if let lastFile = Preference.url(for: .iinaLastPlayedFilePath),
+       lastFile.resolvingSymlinksInPath() == url.resolvingSymlinksInPath() {
+      Preference.set(nil, for: .iinaLastPlayedFilePath)
+      Preference.set(nil, for: .iinaLastPlayedFilePosition)
+    }
+
+    reloadData()
+  }
+
+  private func removeRecentDocumentAfterConfirmation(at rowIndex: Int) {
+    guard recentDocuments[at: rowIndex] != nil else { return }
+    Utility.quickAskPanel("delete_history", sheetWindow: window) { [weak self] response in
+      guard response == .alertFirstButtonReturn else { return }
+      self?.removeRecentDocument(at: rowIndex)
+    }
+  }
+
+  /// Clears both the recent documents list and the playback history.
+  @objc func clearAllRecentDocuments(_ sender: Any?) {
+    // Check the system list rather than `recentDocuments`, which is empty while the history
+    // switch is off. Otherwise the button would silently do nothing exactly when the user
+    // needs it most: history turned off but old records still stored.
+    guard !NSDocumentController.shared.recentDocumentURLs.isEmpty
+            || !HistoryController.shared.history.isEmpty else { return }
+    Utility.quickAskPanel("delete_all_history", sheetWindow: window) { [weak self] response in
+      guard response == .alertFirstButtonReturn else { return }
+      NSDocumentController.shared.clearRecentDocuments(nil)
+      AppDelegate.shared.saveRecentDocuments()
+      HistoryController.shared.removeAll()
+      self?.reloadData()
+    }
+  }
+
+  // MARK: - Context menu
+
+  func menuNeedsUpdate(_ menu: NSMenu) {
+    menu.removeAllItems()
+    guard !recentDocuments.isEmpty else { return }
+
+    let clicked = recentFilesTableView.clickedRow
+    menuTargetRow = clicked >= 0 ? clicked : recentFilesTableView.selectedRow
+    let url = recentDocuments[at: menuTargetRow]
+
+    let playItem = NSMenuItem(title: NSLocalizedString("history_window.menu.play", comment: "Play"),
+                              action: #selector(playRecentItem(_:)), keyEquivalent: "")
+    playItem.target = self
+    playItem.isEnabled = url != nil
+    menu.addItem(playItem)
+
+    let showInFinderItem = NSMenuItem(title: NSLocalizedString("history_window.menu.show_in_finder", comment: "Show in Finder"),
+                                      action: #selector(showRecentItemInFinder(_:)), keyEquivalent: "")
+    showInFinderItem.target = self
+    showInFinderItem.isEnabled = url != nil
+    menu.addItem(showInFinderItem)
+
+    menu.addItem(.separator())
+
+    let deleteItem = NSMenuItem(title: NSLocalizedString("history_window.menu.delete", comment: "Delete…"),
+                                action: #selector(deleteRecentItem(_:)), keyEquivalent: "\u{8}")
+    deleteItem.target = self
+    deleteItem.isEnabled = url != nil
+    menu.addItem(deleteItem)
+
+    let clearItem = NSMenuItem(title: NSLocalizedString("history_window.toolbar.clear", comment: "Clear Playback History"),
+                               action: #selector(clearAllRecentDocuments(_:)), keyEquivalent: "")
+    clearItem.target = self
+    menu.addItem(clearItem)
+  }
+
+  @objc private func playRecentItem(_ sender: Any?) {
+    openRecentItemFromTable(menuTargetRow)
+  }
+
+  @objc private func showRecentItemInFinder(_ sender: Any?) {
+    guard let url = recentDocuments[at: menuTargetRow] else { return }
+    showInFinder(url)
+  }
+
+  @objc private func deleteRecentItem(_ sender: Any?) {
+    removeRecentDocumentAfterConfirmation(at: menuTargetRow)
+  }
+
   func loadLastPlaybackInfo() {
     guard loaded else { return }
+    // The "continue last playback" button is a form of playback history as well, so hide
+    // it together with the recent list when history recording is disabled.
     if Preference.bool(for: .recordRecentFiles),
+      Preference.bool(for: .recordPlaybackHistory),
       Preference.bool(for: .resumeLastPosition),
       let lastFile = Preference.url(for: .iinaLastPlayedFilePath),
       FileManager.default.fileExists(atPath: lastFile.path) {
@@ -329,8 +508,25 @@ class InitialWindowController: NSWindowController {
   func reloadData() {
     guard loaded else { return }
     loadLastPlaybackInfo()
-    recentDocuments = makeRecentDocumentsList()
+
+    // When "record playback history" is off, the list is hidden altogether. This is
+    // what the user expects: turning the switch off should make the records invisible,
+    // not just stop adding new ones.
+    let historyEnabled = Preference.bool(for: .recordPlaybackHistory)
+    if historyEnabled {
+      recentDocuments = makeRecentDocumentsList()
+    } else {
+      recentDocuments = []
+    }
     recentFilesTableView.reloadData()
+
+    if !historyEnabled {
+      emptyLabel.stringValue = NSLocalizedString("initial.recent.disabled", comment: "Playback history is turned off")
+    } else if recentDocuments.isEmpty {
+      emptyLabel.stringValue = NSLocalizedString("initial.recent.empty", comment: "No recent items")
+    }
+    emptyLabel.isHidden = !recentDocuments.isEmpty
+    recentFilesTableView.enclosingScrollView?.isHidden = !historyEnabled
 
     if Logger.isEmitting(.verbose) {
       let last = lastPlaybackURL.flatMap { $0.resolvingSymlinksInPath().path } ?? "<none>"
@@ -439,6 +635,12 @@ extension InitialWindowController: NSTableViewDelegate, NSTableViewDataSource {
         }
         // default: let recentFilesTableView handle it
         recentFilesTableView.keyDown(with: event)
+      case "DEL", "BS":  // DELETE or BACKSPACE
+        if recentFilesTableView.selectedRow >= 0 {
+          removeRecentDocumentAfterConfirmation(at: recentFilesTableView.selectedRow)
+        } else {
+          super.keyDown(with: event)  // no selection: beep at user
+        }
       default:
         super.keyDown(with: event)
     }
