@@ -35,7 +35,9 @@ swiftc -emit-library -static -emit-module -module-name Just \
   "$BUILD/Just/Sources/Just/Just.swift"
 
 # ---- 4. PromiseKit（排除 AnyPromise.swift / Deprecations.swift，需 -D SWIFT_PACKAGE） ----
-mapfile -t PK_SRCS < <(find "$BUILD/PromiseKit/Sources" -name '*.swift' \
+# macOS 自带 bash 3.2 没有 mapfile，用 read 循环代替。
+PK_SRCS=()
+while IFS= read -r f; do PK_SRCS+=("$f"); done < <(find "$BUILD/PromiseKit/Sources" -name '*.swift' \
   ! -name 'AnyPromise.swift' ! -name 'Deprecations.swift' | sort)
 swiftc -emit-library -static -emit-module -module-name PromiseKit \
   -target "$TARGET" -sdk "$SDK" -swift-version 5 -D SWIFT_PACKAGE \
@@ -61,7 +63,8 @@ clang -c -target "$TARGET" -isysroot "$SDK" -fobjc-arc \
 ar rcs "$OUT/libGRMustacheKeyAccess.a" "$OUT/GRMustacheKeyAccess.o"
 
 # ---- 6. Mustache（定义 OBJC，走 GRMustacheKeyAccess 分支） ----
-mapfile -t MS_SRCS < <(find "$BUILD/GRMustache.swift/Sources" -name '*.swift' | sort)
+MS_SRCS=()
+while IFS= read -r f; do MS_SRCS+=("$f"); done < <(find "$BUILD/GRMustache.swift/Sources" -name '*.swift' | sort)
 swiftc -emit-library -static -emit-module -module-name Mustache \
   -target "$TARGET" -sdk "$SDK" -swift-version 5 -D OBJC \
   -module-cache-path "$BUILD/mcache" \

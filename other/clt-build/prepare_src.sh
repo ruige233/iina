@@ -17,11 +17,13 @@ python3 - "$BUILD/src/JavascriptDevTool.swift" "$BUILD/src/PluginStorePanel.swif
 import re, sys
 
 # 匹配：@State [private ]var name[: Type][ = init]
+# 注意必须带 re.M：这些声明位于文件中间，没有 MULTILINE 时 `^` 只匹配文件开头（曾因此静默展开 0 处）。
 state_re = re.compile(
-    r'^(?P<indent>\s*)@State\s+(?:private\s+)?var\s+'
+    r'^(?P<indent>[ \t]*)@State\s+(?:private\s+)?var\s+'
     r'(?P<name>[A-Za-z_][A-Za-z0-9_]*)'
     r'(?:\s*:\s*(?P<type>[^=\n]+?))?'
-    r'(?:\s*=\s*(?P<init>[^\n]+?))?\s*$'
+    r'(?:\s*=\s*(?P<init>[^\n]+?))?[ \t]*$',
+    re.M
 )
 
 def infer_type(name, typ, init):
@@ -49,9 +51,13 @@ for path in sys.argv[1:]:
         name = m.group('name')
         typ = infer_type(name, m.group('type'), m.group('init'))
         init = (m.group('init') or '').strip()
+        if not init:
+            # 无初始值的声明只出现在可选类型上（如 `@State private var errorMessage: String?`）。
+            if not typ.rstrip().endswith('?'):
+                raise SystemExit(f'@State {name}: {typ} has no initial value')
+            init = 'nil'
         names.append(name)
-        decl = f"{indent}private var _{name} = State<{typ}>(" \
-               + (f"initialValue: {init})" if init else ")")
+        decl = f"{indent}private var _{name} = State<{typ}>(initialValue: {init})"
         accessor = (
             f"{indent}private var {name}: {typ} {{\n"
             f"{indent}  get {{ _{name}.wrappedValue }}\n"

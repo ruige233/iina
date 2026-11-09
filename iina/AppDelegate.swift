@@ -109,7 +109,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
   }
 
   // MARK: - Logs
-  private let observedPrefKeys: [Preference.Key] = [.logLevel, .thumbnailWidth]
+  private let observedPrefKeys: [Preference.Key] = [.logLevel, .thumbnailWidth, .recordPlaybackHistory]
 
   override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
     guard let keyPath, let change else { return }
@@ -121,6 +121,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
       }
     case Preference.Key.thumbnailWidth.rawValue:
       ThumbnailCache.clearThumbnailCache()
+    case Preference.Key.recordPlaybackHistory.rawValue:
+      // The switch means "keep a playback history", not "show a playback history". Turning it off
+      // therefore has to delete what is already stored; merely hiding the list would leave the old
+      // entries on disk and make them reappear in full as soon as the switch was turned back on.
+      if let newValue = change[.newKey] as? Bool, !newValue {
+        clearAllPlaybackHistory(logReason: "the user turned record playback history off")
+      }
 
     default:
       return
@@ -363,6 +370,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
     if !isReady {
       getReady()
+    }
+
+    // The playback history switch is authoritative. If recording is disabled, any entries left over
+    // from an earlier run (or from a build that only hid the list) must go now, otherwise they would
+    // show up again as soon as the user turned the switch on.
+    if !Preference.bool(for: .recordPlaybackHistory) {
+      clearAllPlaybackHistory(logReason: "record playback history is off at launch")
     }
 
     // see https://sparkle-project.org/documentation/api-reference/Classes/SPUUpdater.html#/c:objc(cs)SPUUpdater(im)clearFeedURLFromUserDefaults
@@ -1282,6 +1296,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     } else {
       Logger.log("Saved list of recent documents")
     }
+  }
+
+  /// Deletes every trace of playback history.
+  ///
+  /// This covers the three places history is kept: the system recent documents list, the IINA
+  /// playback history file and the "continue last playback" record. It is used when the user turns
+  /// "record playback history" off, because that switch promises a history, not merely a hidden
+  /// list: once it is off the stored entries must be gone and must not come back when it is
+  /// turned on again.
+  /// - Parameter reason: Why the history is being cleared, used for logging.
+  func clearAllPlaybackHistory(logReason reason: String) {
+    Logger.log("Clearing all playback history: \(reason)")
+    NSDocumentController.shared.clearRecentDocuments(nil)
+    saveRecentDocuments()
+    // `saveRecentDocuments` does nothing unless the Sonoma recent documents workaround is enabled,
+    // so the backup copy has to be cleared unconditionally. Otherwise `restoreRecentDocuments`
+    // would bring the deleted entries back on the next launch.
+    Preference.set(nil, for: .recentDocuments)
+    HistoryController.shared.removeAll()
   }
 }
 

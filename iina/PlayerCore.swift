@@ -2007,12 +2007,17 @@ class PlayerCore: NSObject {
       mpv.command(.writeWatchLaterConfig, level: .verbose)
     }
     if let url = info.currentURL {
-      Preference.set(url, for: .iinaLastPlayedFilePath)
+      // The home window offers the last played file as "continue last playback", which is part of
+      // the playback history. Do not remember it while history recording is off, otherwise the
+      // entry would reappear the moment the switch was turned back on.
+      if Preference.bool(for: .recordPlaybackHistory) {
+        Preference.set(url, for: .iinaLastPlayedFilePath)
+      }
       // Write to cache directly (rather than calling `refreshCachedVideoProgress`).
       // If user only closed the window but didn't quit the app, this can make sure playlist displays the correct progress.
       info.setCachedVideoDurationAndProgress(url.path, (duration: info.videoDuration?.second, progress: info.videoPosition?.second))
     }
-    if let position = info.videoPosition?.second {
+    if Preference.bool(for: .recordPlaybackHistory), let position = info.videoPosition?.second {
       Preference.set(position, for: .iinaLastPlayedFilePosition)
     }
   }

@@ -45,7 +45,15 @@ class InitialWindowController: NSWindowController, NSMenuDelegate {
   private var currentlyHoveredRow: GrayHighlightRowView?
 
   private var historyToggle: NSSwitch!
+  private var clearButton: NSButton!
   private var emptyLabel: NSTextField!
+  private var historyUpdatedObserver: NSObjectProtocol?
+
+  deinit {
+    if let historyUpdatedObserver {
+      NotificationCenter.default.removeObserver(historyUpdatedObserver)
+    }
+  }
 
   override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
     guard let keyPath, let change else { return }
@@ -239,12 +247,15 @@ class InitialWindowController: NSWindowController, NSMenuDelegate {
     historyToggleLabel.textColor = .secondaryLabelColor
     historyToggleLabel.lineBreakMode = .byTruncatingTail
 
-    let clearButton = NSButton(title: NSLocalizedString("history_window.toolbar.clear", comment: "Clear Playback History"), target: self, action: #selector(clearAllRecentDocuments(_:)))
+    self.clearButton = NSButton(title: NSLocalizedString("history_window.toolbar.clear", comment: "Clear Playback History"), target: self, action: #selector(clearAllRecentDocuments(_:)))
     clearButton.translatesAutoresizingMaskIntoConstraints = false
     clearButton.isBordered = false
     clearButton.controlSize = .small
     clearButton.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
     clearButton.contentTintColor = .controlAccentColor
+    // Kept in sync with the stored history in `reloadData()`. A button that is enabled but silently
+    // does nothing is exactly what made clearing history look broken after the first time.
+    clearButton.isEnabled = false
 
     let footerRow = ui.hStack(spacing: 6, historyToggle, historyToggleLabel, ui.flexibleSpace(), clearButton)
     mainView.addSubview(footerRow)
@@ -283,6 +294,13 @@ class InitialWindowController: NSWindowController, NSMenuDelegate {
     observedPrefKeys.forEach { key in
       UserDefaults.standard.addObserver(self, forKeyPath: key.rawValue, options: .new, context: nil)
     }
+    // History is also written and deleted outside this window (playback finishing in the background,
+    // clearing from the menu bar). Refreshing on the notification keeps the list and the clear button
+    // in step with what is actually stored.
+    historyUpdatedObserver = NotificationCenter.default.addObserver(
+      forName: .iinaHistoryUpdated, object: nil, queue: .main) { [weak self] _ in
+        self?.reloadData()
+      }
     reloadData()
   }
 
@@ -416,18 +434,29 @@ class InitialWindowController: NSWindowController, NSMenuDelegate {
     }
   }
 
+  /// Whether there is anything stored that the "clear playback history" button could delete.
+  ///
+  /// This deliberately looks at the real stores rather than at `recentDocuments`, which is empty
+  /// while the history switch is off or while the last played file is being shown separately.
+  private var hasStoredHistory: Bool {
+    !NSDocumentController.shared.recentDocumentURLs.isEmpty || !HistoryController.shared.history.isEmpty
+  }
+
   /// Clears both the recent documents list and the playback history.
   @objc func clearAllRecentDocuments(_ sender: Any?) {
     // Check the system list rather than `recentDocuments`, which is empty while the history
     // switch is off. Otherwise the button would silently do nothing exactly when the user
     // needs it most: history turned off but old records still stored.
-    guard !NSDocumentController.shared.recentDocumentURLs.isEmpty
-            || !HistoryController.shared.history.isEmpty else { return }
+    guard hasStoredHistory else {
+      reloadData()
+      return
+    }
+    // A second click while the confirmation sheet is still up must not try to attach a second
+    // sheet to the same window.
+    guard let window, window.attachedSheet == nil else { return }
     Utility.quickAskPanel("delete_all_history", sheetWindow: window) { [weak self] response in
       guard response == .alertFirstButtonReturn else { return }
-      NSDocumentController.shared.clearRecentDocuments(nil)
-      AppDelegate.shared.saveRecentDocuments()
-      HistoryController.shared.removeAll()
+      AppDelegate.shared.clearAllPlaybackHistory(logReason: "the user cleared the playback history")
       self?.reloadData()
     }
   }
@@ -465,6 +494,7 @@ class InitialWindowController: NSWindowController, NSMenuDelegate {
     let clearItem = NSMenuItem(title: NSLocalizedString("history_window.toolbar.clear", comment: "Clear Playback History"),
                                action: #selector(clearAllRecentDocuments(_:)), keyEquivalent: "")
     clearItem.target = self
+    clearItem.isEnabled = hasStoredHistory
     menu.addItem(clearItem)
   }
 
@@ -519,6 +549,7 @@ class InitialWindowController: NSWindowController, NSMenuDelegate {
       recentDocuments = []
     }
     recentFilesTableView.reloadData()
+    clearButton?.isEnabled = hasStoredHistory
 
     if !historyEnabled {
       emptyLabel.stringValue = NSLocalizedString("initial.recent.disabled", comment: "Playback history is turned off")
